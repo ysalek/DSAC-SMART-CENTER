@@ -5,12 +5,14 @@ import axios from "axios";
 admin.initializeApp();
 const db = admin.firestore();
 
-// CONFIGURACIÓN:
-// En producción, usa: functions.config().whatsapp.token y .phone_id
-// Para este entorno, usamos variables de entorno o valores por defecto controlados.
+// Configuración obligatoria mediante variables de entorno
 const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN || "dsac_santa_cruz_token";
-const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN || "EAAM..."; // REEMPLAZAR CON TOKEN REAL O VAR DE ENTORNO
-const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_ID || "100..."; // REEMPLAZAR CON ID REAL
+const WHATSAPP_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN;
+const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_ID;
+
+if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+  console.warn("ADVERTENCIA: Tokens de WhatsApp no configurados en variables de entorno.");
+}
 
 /**
  * Webhook para recibir eventos de WhatsApp Cloud API
@@ -36,7 +38,6 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
     try {
       const body = req.body;
       
-      // Validación básica de estructura de mensaje entrante
       if (
         body.object &&
         body.entry &&
@@ -48,10 +49,9 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
         const messageData = value.messages[0];
         const msgType = messageData.type;
         
-        const from = messageData.from; // ID del ciudadano (teléfono)
+        const from = messageData.from;
         const profileName = value.contacts?.[0]?.profile?.name || "Ciudadano";
         
-        // Manejo de contenido según tipo
         let textBody = "";
         let locationData = null;
         
@@ -93,7 +93,6 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
         }
 
         // B. Buscar Conversación Activa
-        // Usamos el índice compuesto: citizenId ASC, status ASC
         const conversationsRef = db.collection("conversations");
         const activeConvoQuery = await conversationsRef
           .where("citizenId", "==", from)
@@ -152,7 +151,6 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
           if (settings?.autoReplyEnabled) {
             const welcomeText = "👋 ¡Hola! Bienvenido a la DSAC. Un agente atenderá tu consulta en breve.";
             
-            // Registrar respuesta del bot
             await db.collection("messages").add({
               conversationId: conversationId,
               senderType: "bot",
@@ -161,9 +159,8 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
             });
 
-            // Enviar a WhatsApp
-            try {
-              if (WHATSAPP_TOKEN && !WHATSAPP_TOKEN.includes("YOUR_")) {
+            if (WHATSAPP_TOKEN && PHONE_NUMBER_ID) {
+              try {
                  await axios.post(
                   `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
                   {
@@ -180,17 +177,13 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
                     },
                   }
                 );
-              } else {
-                functions.logger.warn("Token de WhatsApp no configurado, no se envió auto-reply.");
+              } catch (e: any) {
+                 functions.logger.error("Error enviando auto-reply:", e.response?.data || e.message);
               }
-            } catch (e: any) {
-               functions.logger.error("Error enviando auto-reply:", e.response?.data || e.message);
             }
           }
         }
       }
-      
-      // Responder siempre 200 a Meta para evitar reintentos
       res.sendStatus(200);
     } catch (error) {
       functions.logger.error("Error crítico en webhook:", error);
@@ -200,11 +193,9 @@ export const whatsappWebhook = functions.https.onRequest(async (req, res) => {
 });
 
 /**
- * Función SEGURA para enviar mensaje desde el Operador hacia WhatsApp.
- * Soporta Texto, Imágenes y Audio si se provee `mediaUrl`.
+ * Función para enviar mensaje desde el Operador hacia WhatsApp.
  */
 export const sendWhatsAppMessage = functions.https.onRequest(async (req, res) => {
-  // CORS
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -214,7 +205,6 @@ export const sendWhatsAppMessage = functions.https.onRequest(async (req, res) =>
     return;
   }
 
-  // 1. Verificación de Seguridad (Auth Token)
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     res.status(401).send({ error: "No autorizado. Token faltante." });
@@ -223,24 +213,21 @@ export const sendWhatsAppMessage = functions.https.onRequest(async (req, res) =>
 
   const idToken = authHeader.split('Bearer ')[1];
   try {
-    // Validar token contra Firebase Auth
     await admin.auth().verifyIdToken(idToken);
   } catch (error) {
     res.status(403).send({ error: "Token inválido o expirado." });
     return;
   }
 
-  // 2. Procesar Envío
-  const { conversationId, to, text, senderAgentId, mediaUrl } = req.body;
+  const { to, text, senderAgentId, mediaUrl } = req.body;
 
   if (!to || (!text && !mediaUrl)) {
-    res.status(400).send({ error: "Faltan parámetros 'to' o contenido ('text'/'mediaUrl')." });
+    res.status(400).send({ error: "Faltan parámetros requeridos." });
     return;
   }
 
-  // Verificar configuración
-  if (!WHATSAPP_TOKEN || WHATSAPP_TOKEN.includes("YOUR_")) {
-    res.status(503).send({ error: "Servicio de WhatsApp no configurado en el servidor." });
+  if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID) {
+    res.status(503).send({ error: "WhatsApp no configurado en el servidor." });
     return;
   }
 
@@ -252,30 +239,18 @@ export const sendWhatsAppMessage = functions.https.onRequest(async (req, res) =>
     };
 
     if (mediaUrl) {
-      // Detección básica de tipo de medio por extensión
       const url = mediaUrl.toLowerCase();
-      
-      if (url.includes(".pdf") || url.includes(".doc") || url.includes(".docx")) {
+      if (url.includes(".pdf") || url.includes(".doc")) {
          payload.type = "document";
-         payload.document = {
-           link: mediaUrl,
-           caption: text || "Documento Adjunto"
-         };
-      } else if (url.includes(".mp3") || url.includes(".ogg") || url.includes(".wav") || url.includes(".aac")) {
+         payload.document = { link: mediaUrl, caption: text || "Documento" };
+      } else if (url.includes(".mp3") || url.includes(".ogg") || url.includes(".wav")) {
          payload.type = "audio";
-         payload.audio = {
-           link: mediaUrl
-         };
+         payload.audio = { link: mediaUrl };
       } else {
-         // Default to image for other types
          payload.type = "image";
-         payload.image = {
-           link: mediaUrl,
-           caption: text || ""
-         };
+         payload.image = { link: mediaUrl, caption: text || "" };
       }
     } else {
-      // Envío de Texto solo
       payload.type = "text";
       payload.text = { body: text };
     }
@@ -293,10 +268,7 @@ export const sendWhatsAppMessage = functions.https.onRequest(async (req, res) =>
 
     res.status(200).send({ success: true, agent: senderAgentId });
   } catch (error: any) {
-    functions.logger.error("Error enviando mensaje WhatsApp:", error.response?.data || error.message);
-    res.status(500).send({ 
-      error: "Error en WhatsApp Cloud API", 
-      details: error.response?.data 
-    });
+    functions.logger.error("Error WhatsApp API:", error.response?.data || error.message);
+    res.status(500).send({ error: "Error externo en WhatsApp API" });
   }
 });

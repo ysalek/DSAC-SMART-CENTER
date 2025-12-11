@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Download, Filter, Calendar, BarChart2 } from 'lucide-react';
-import { collection, query, where, getDocs, orderBy, Timestamp } from 'firebase/firestore';
+import { collection, query, where, getDocs, orderBy, Timestamp, FirestoreError } from 'firebase/firestore';
 import { db } from '../src/firebase';
 import { Conversation, Agent } from '../types';
 import { getAgents } from '../services/agentsService';
@@ -32,29 +32,58 @@ const Reports: React.FC = () => {
       const end = new Date(endDate);
       end.setHours(23, 59, 59, 999);
 
-      // Consulta simplificada: Solo por rango de fecha, filtro de estado en cliente
-      // Esto evita requerir un índice compuesto (status + updatedAt)
-      const q = query(
-        collection(db, 'conversations'),
-        where('updatedAt', '>=', Timestamp.fromDate(start)),
-        where('updatedAt', '<=', Timestamp.fromDate(end)),
-        orderBy('updatedAt', 'desc')
-      );
+      let data: Conversation[] = [];
 
-      const snapshot = await getDocs(q);
-      let data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Conversation));
+      try {
+        // INTENTO 1: Consulta Optimizada (Requiere índice compuesto: status + updatedAt)
+        // Si el índice está construyéndose o falta, esto lanzará un error.
+        const q = query(
+          collection(db, 'conversations'),
+          where('updatedAt', '>=', Timestamp.fromDate(start)),
+          where('updatedAt', '<=', Timestamp.fromDate(end)),
+          where('status', '==', 'CLOSED'), 
+          orderBy('updatedAt', 'desc')
+        );
 
-      // Filtros en memoria
-      data = data.filter(c => c.status === 'CLOSED');
+        const snapshot = await getDocs(q);
+        data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Conversation));
 
+      } catch (err: any) {
+         // INTENTO 2: Fallback (Modo Compatibilidad)
+         // Si falla por índice, hacemos una consulta más simple (solo por fecha) que usa índices automáticos
+         // y filtramos el estado en memoria.
+         if (err.code === 'failed-precondition' || err.message?.includes('index')) {
+            console.warn("⚠️ Índice de Reportes no disponible (construyéndose o faltante). Usando filtrado en cliente para continuidad operativa.");
+            
+            const qFallback = query(
+              collection(db, 'conversations'),
+              where('updatedAt', '>=', Timestamp.fromDate(start)),
+              where('updatedAt', '<=', Timestamp.fromDate(end)),
+              // Quitamos 'status' de la query para no requerir índice compuesto complejo
+              orderBy('updatedAt', 'desc')
+            );
+            
+            const snapshot = await getDocs(qFallback);
+            
+            // Filtramos manualmente en memoria
+            data = snapshot.docs
+              .map(doc => ({ id: doc.id, ...doc.data() } as Conversation))
+              .filter(c => c.status === 'CLOSED');
+         } else {
+            // Si es otro error (permisos, red), lo lanzamos
+            throw err;
+         }
+      }
+
+      // Filtro de Agente (siempre en memoria)
       if (selectedAgent !== 'ALL') {
         data = data.filter(c => c.assignedAgentId === selectedAgent);
       }
 
       setConversations(data);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error fetching reports:", error);
-      alert("Error cargando reportes.");
+      alert("Error cargando reportes. Revisa la consola para más detalles.");
     } finally {
       setLoading(false);
     }

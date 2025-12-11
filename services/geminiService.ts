@@ -1,19 +1,26 @@
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { Message } from "../types";
 
-// Inicializar cliente Gemini
-// En Vite usamos import.meta.env.VITE_... pero respetamos la guía si process.env está configurado por el bundler.
-// Por robustez en este entorno mixto, intentamos leer la key disponible.
-const meta = import.meta as any;
-const apiKey = meta.env?.VITE_GEMINI_API_KEY || process.env.API_KEY || "";
-const ai = new GoogleGenAI({ apiKey });
+// Función segura para obtener la API Key en entorno Vite/Browser
+const getApiKey = () => {
+  const meta = import.meta as any;
+  // 1. Intentar variable de entorno de Vite (Estándar)
+  if (meta.env && meta.env.VITE_GEMINI_API_KEY) {
+    return meta.env.VITE_GEMINI_API_KEY;
+  }
+  // 2. Intentar process.env (Polyfill o Node)
+  if (typeof process !== 'undefined' && process.env && process.env.API_KEY) {
+    return process.env.API_KEY;
+  }
+  return "";
+};
 
-// Modelo optimizado para tareas generales y rapidez
+const ai = new GoogleGenAI({ apiKey: getApiKey() });
+
 const MODEL_NAME = "gemini-2.5-flash";
 
 /**
  * Genera una sugerencia de respuesta (Smart Reply)
- * Optimizado: Envía historial estructurado y limita tokens.
  */
 export const generateSmartReply = async (
   conversationHistory: Message[],
@@ -23,8 +30,7 @@ export const generateSmartReply = async (
 ): Promise<string> => {
   if (conversationHistory.length === 0) return "";
 
-  // 1. Filtrar y formatear historial (últimos 8 mensajes para ahorrar tokens)
-  // Mapeamos 'citizen' -> 'user' y 'agent' -> 'model'
+  // 1. Filtrar historial (últimos 8 mensajes) para eficiencia de tokens
   const relevantHistory = conversationHistory.slice(-8);
   
   const historyParts = relevantHistory.map(m => ({
@@ -33,44 +39,43 @@ export const generateSmartReply = async (
   }));
 
   const systemInstruction = `
-    Eres un asistente oficial de la Dirección de Atención al Ciudadano (DSAC) de Santa Cruz de la Sierra, Bolivia.
+    Eres un asistente oficial de la Dirección de Atención al Ciudadano (DSAC) de Santa Cruz de la Sierra.
+    Objetivo: Sugerir una respuesta útil, breve y empática para que el operador la envíe al ciudadano.
+    Idioma: Español (Bolivia).
+    Reglas:
+    - Usa SOLO la información provista en el CONTEXTO.
+    - Si no sabes la respuesta, sugiere pedir más datos o derivar al área correspondiente.
+    - Sé profesional y amable.
+
+    CONTEXTO (Base de Conocimiento):
+    ${knowledgeBaseContext || "No hay información adicional."}
     
-    TUS OBJETIVOS:
-    1. Sugerir una respuesta empática, profesional y directa para el operador.
-    2. Usar español neutro latinoamericano.
-    3. Basarte EXCLUSIVAMENTE en el contexto proporcionado (Base de Conocimiento).
-    4. Si no hay info en el contexto, sugiere pedir más detalles amablemente o derivar.
-    
-    CONTEXTO (RAG):
-    ${knowledgeBaseContext || "No hay información adicional disponible."}
-    
-    ${customSystemPrompt ? `INSTRUCCIÓN EXTRA: ${customSystemPrompt}` : ''}
+    ${customSystemPrompt ? `Instrucción del sistema: ${customSystemPrompt}` : ''}
   `;
 
   try {
     const response = await ai.models.generateContent({
       model: MODEL_NAME,
       contents: [
-        ...historyParts, // Historial previo
-        { role: 'user', parts: [{ text: `Genera una respuesta sugerida para ${citizenName} basada en lo anterior.` }] }
+        ...historyParts,
+        { role: 'user', parts: [{ text: `Genera una respuesta sugerida para ${citizenName}.` }] }
       ],
       config: {
         systemInstruction: systemInstruction,
         temperature: 0.3,
-        maxOutputTokens: 150, // Respuesta breve
+        maxOutputTokens: 200,
       }
     });
 
     return response.text?.trim() || "";
   } catch (error) {
-    console.error("Gemini API Error (Smart Reply):", error);
+    console.error("Gemini Smart Reply Error:", error);
     return ""; 
   }
 };
 
 /**
  * Analiza el caso completo para generar resumen y etiquetas (Structured Output)
- * Optimizado: Usa responseSchema para garantizar JSON válido.
  */
 export const analyzeCaseConversation = async (
   messages: Message[],
@@ -78,7 +83,6 @@ export const analyzeCaseConversation = async (
 ): Promise<{ summary: string; tags: string[] }> => {
   if (messages.length === 0) return { summary: "", tags: [] };
 
-  // Convertimos la conversación a un formato de texto claro para el análisis
   const conversationText = messages
     .map(m => `${m.senderType === 'agent' ? 'Operador' : 'Ciudadano'}: ${m.content}`)
     .join('\n');
@@ -88,15 +92,13 @@ export const analyzeCaseConversation = async (
       model: MODEL_NAME,
       contents: {
         parts: [{
-          text: `Analiza la siguiente conversación de soporte y extrae los datos solicitados:\n\n${conversationText}`
+          text: `Analiza esta conversación:\n\n${conversationText}`
         }]
       },
       config: {
         systemInstruction: `
-          Eres un analista de calidad de Call Center. 
-          Tu tarea es resumir el caso y asignar etiquetas de categoría.
-          Las etiquetas permitidas son: TRAMITE, IMPUESTOS, SALUD, EMERGENCIA, QUEJA, INFORMACION, OTRO.
-          El resumen debe ser de máximo 2 oraciones.
+          Eres un analista de calidad. Resume el caso en máximo 2 oraciones y asigna etiquetas.
+          Etiquetas permitidas: TRAMITE, IMPUESTOS, SALUD, EMERGENCIA, QUEJA, INFORMACION, OTRO.
         `,
         responseMimeType: "application/json",
         responseSchema: {
@@ -104,44 +106,42 @@ export const analyzeCaseConversation = async (
           properties: {
             summary: { 
               type: Type.STRING, 
-              description: "Resumen ejecutivo del problema y solución (si la hubo)." 
+              description: "Resumen ejecutivo del problema y solución." 
             },
             tags: { 
               type: Type.ARRAY, 
               items: { type: Type.STRING },
-              description: "Lista de categorías aplicables al caso."
+              description: "Categorías del caso."
             }
           },
           required: ["summary", "tags"]
         },
-        temperature: 0.1, // Baja temperatura para análisis factual
+        temperature: 0.1,
       }
     });
 
-    // Al usar responseMimeType json, response.text es un string JSON válido.
     if (response.text) {
       return JSON.parse(response.text);
     }
-    return { summary: "No se pudo generar el análisis.", tags: [] };
+    return { summary: "No se pudo generar análisis.", tags: [] };
     
   } catch (error) {
-    console.error("Gemini API Error (Analysis):", error);
-    return { summary: "Error al conectar con IA.", tags: [] };
+    console.error("Gemini Analysis Error:", error);
+    return { summary: "Error de IA.", tags: [] };
   }
 };
 
 /**
- * Clasificador rápido de intención
+ * Clasificador rápido de intención (Single token/word)
  */
 export const analyzeIntent = async (text: string): Promise<string> => {
   if (!text) return "OTRO";
-  
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash", // Usar modelo rápido
+      model: "gemini-2.5-flash",
       contents: {
          parts: [{
-             text: `Clasifica este mensaje de un ciudadano en UNA sola palabra: TRAMITE, EMERGENCIA, IMPUESTOS, SALUD, QUEJA, SALUDO, OTRO. Mensaje: "${text}"`
+             text: `Clasifica este mensaje: "${text}". Categorías: TRAMITE, EMERGENCIA, IMPUESTOS, SALUD, QUEJA, SALUDO, OTRO. Solo responde con la categoría.`
          }]
       },
       config: {

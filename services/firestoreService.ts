@@ -15,72 +15,98 @@ import {
   limit,
   startAfter,
   limitToLast,
-  QueryDocumentSnapshot
+  QueryDocumentSnapshot,
+  FirestoreError,
+  Timestamp
 } from 'firebase/firestore';
 import { db } from '../src/firebase';
 import { Conversation, Message, SystemSettings } from '../types';
 
 // --- CONVERSATIONS ---
 
-// Escuchar solo conversaciones activas
-// Optimización: Traemos un subconjunto y ordenamos en cliente para evitar requerir índices compuestos complejos en desarrollo.
 export const subscribeToConversations = (callback: (convos: Conversation[]) => void) => {
+  // Requiere índice compuesto: status (ASC) + lastMessageAt (DESC)
+  // Este índice debe estar en firestore.indexes.json y desplegado.
   const q = query(
     collection(db, 'conversations'),
     where('status', 'in', ['OPEN', 'IN_PROGRESS']),
-    limit(100) // Límite de seguridad
+    orderBy('lastMessageAt', 'desc'),
+    limit(100)
   );
 
-  return onSnapshot(q, (snapshot) => {
-    const convos = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    } as Conversation));
-    
-    // Ordenamiento en cliente: Más reciente primero
-    convos.sort((a, b) => {
-       const tA = a.lastMessageAt?.seconds || 0;
-       const tB = b.lastMessageAt?.seconds || 0;
-       return tB - tA;
-    });
-
-    callback(convos);
+  return onSnapshot(q, {
+    next: (snapshot) => {
+      const convos = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      } as Conversation));
+      callback(convos);
+    },
+    error: (error: FirestoreError) => {
+      // Detección específica de error de índice
+      if (error.code === 'failed-precondition' || error.message.includes('index')) {
+        if (error.message.includes('building')) {
+           console.warn("⚠️ EL ÍNDICE SE ESTÁ CONSTRUYENDO... ESPERA UNOS MINUTOS PARA VER LOS CHATS ⚠️");
+        } else {
+           console.error("🚨 FALTA ÍNDICE DE CONVERSACIONES 🚨");
+           console.error("Abre este enlace para crearlo automáticamente:", error.message);
+           console.info("O ejecuta: firebase deploy --only firestore:indexes");
+        }
+      } else {
+        console.error("Error suscripción conversaciones:", error);
+      }
+    }
   });
 };
 
 // --- MESSAGES ---
 
-// Escuchar últimos mensajes de un chat
-// Optimización: Usamos limitToLast para no traer todo el historial histórico en la primera carga.
 export const subscribeToMessages = (conversationId: string, callback: (msgs: Message[]) => void) => {
+  if (!conversationId) return () => {};
+
+  // Requiere índice: conversationId (ASC) + createdAt (DESC)
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'asc'),
-    limitToLast(100) 
+    orderBy('createdAt', 'desc'), 
+    limit(100)
   );
 
-  return onSnapshot(q, (snapshot) => {
-    const msgs = snapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    } as Message));
-    callback(msgs);
+  return onSnapshot(q, {
+    next: (snapshot) => {
+      const rawMsgs = snapshot.docs.map(doc => {
+        const data = doc.data();
+        const safeCreatedAt = data.createdAt || Timestamp.now();
+        return {
+          id: doc.id,
+          ...data,
+          createdAt: safeCreatedAt
+        } as Message;
+      });
+      // Invertimos para mostrar cronológicamente (antiguos arriba, nuevos abajo)
+      callback(rawMsgs.reverse());
+    },
+    error: (error: FirestoreError) => {
+      if (error.code === 'failed-precondition') {
+         console.error("🚨 FALTA ÍNDICE DE MENSAJES. Revisa la consola para el enlace de creación.");
+      }
+      console.error("Error suscripción mensajes:", error);
+    }
   });
 };
 
-// Paginación para historial antiguo (Infinite Scroll)
+// Para paginación histórica (scrollear hacia arriba)
 export const getMessagesPage = async (conversationId: string, lastDoc: QueryDocumentSnapshot, pageSize: number = 50) => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'desc'), // Inverso para ir hacia atrás en el tiempo
+    orderBy('createdAt', 'desc'),
     startAfter(lastDoc),
     limit(pageSize)
   );
   
   const snapshot = await getDocs(q);
-  // Revertimos para que el array quede en orden cronológico si se necesita
+  // Invertimos porque vienen DESC pero queremos mostrarlos ASC al insertarlos arriba
   const messages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)).reverse();
   
   return {
@@ -89,20 +115,21 @@ export const getMessagesPage = async (conversationId: string, lastDoc: QueryDocu
   };
 };
 
-// Obtener mensajes una sola vez (para visualización de historial en modal)
 export const getMessagesOnce = async (conversationId: string): Promise<Message[]> => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'asc'),
+    orderBy('createdAt', 'desc'), // Coincide con índice
     limit(100)
   );
   
   const snapshot = await getDocs(q);
-  return snapshot.docs.map(doc => ({
+  const msgs = snapshot.docs.map(doc => ({
     id: doc.id,
     ...doc.data()
   } as Message));
+  
+  return msgs.reverse();
 };
 
 // --- ACTIONS ---
@@ -114,30 +141,55 @@ export const sendMessageAsAgent = async (
   attachments: string[] = [],
   isInternal: boolean = false
 ) => {
-  await addDoc(collection(db, 'messages'), {
-    conversationId,
-    senderType: 'agent',
-    senderId: agentId,
-    content,
-    attachments,
-    isInternal,
-    createdAt: serverTimestamp()
-  });
+  try {
+    // 1. Crear Mensaje
+    await addDoc(collection(db, 'messages'), {
+      conversationId,
+      senderType: 'agent',
+      senderId: agentId,
+      content,
+      attachments,
+      isInternal,
+      createdAt: serverTimestamp()
+    });
 
-  // Solo actualizamos la conversación si NO es nota interna
-  // Esto mantiene el ordenamiento de "último mensaje del ciudadano/agente real" correcto.
-  if (!isInternal) {
-    await updateDoc(doc(db, 'conversations', conversationId), {
-      updatedAt: serverTimestamp(),
-      lastMessageAt: serverTimestamp(),
-      status: 'IN_PROGRESS'
-    });
-  } else {
-    // Para notas internas solo actualizamos updatedAt para auditoría técnica
-    await updateDoc(doc(db, 'conversations', conversationId), {
+    // 2. Actualizar Conversación
+    const updateData: any = {
       updatedAt: serverTimestamp()
-    });
+    };
+
+    if (!isInternal) {
+      updateData.lastMessageAt = serverTimestamp();
+      updateData.status = 'IN_PROGRESS';
+    }
+
+    await updateDoc(doc(db, 'conversations', conversationId), updateData);
+
+  } catch (error) {
+    console.error("Error enviando mensaje agente:", error);
+    throw error;
   }
+};
+
+export const sendMessageAsCitizen = async (conversationId: string, content: string, citizenId: string) => {
+    try {
+      await addDoc(collection(db, 'messages'), {
+          conversationId,
+          senderType: 'citizen',
+          senderId: citizenId,
+          content,
+          createdAt: serverTimestamp()
+      });
+
+      await updateDoc(doc(db, 'conversations', conversationId), {
+          lastMessageAt: serverTimestamp(),
+          unreadCount: increment(1),
+          updatedAt: serverTimestamp()
+      });
+    } catch (error) {
+      console.error("Error enviando mensaje ciudadano:", error);
+      throw error;
+    }
 };
 
 export const assignConversation = async (conversationId: string, agentId: string) => {
@@ -176,7 +228,57 @@ export const closeConversation = async (conversationId: string, disposition: str
   });
 };
 
-// --- SYSTEM SETTINGS ---
+export const startWebConversation = async (name: string, phone: string) => {
+    const citizenRef = doc(db, 'citizens', phone);
+    await setDoc(citizenRef, {
+        name,
+        phoneNumber: phone,
+        channel: 'web',
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp() 
+    }, { merge: true });
+
+    try {
+      // Requiere índice: citizenId (ASC) + status (ASC)
+      const q = query(
+        collection(db, 'conversations'),
+        where('citizenId', '==', phone),
+        where('status', 'in', ['OPEN', 'IN_PROGRESS']),
+        limit(1)
+      );
+      const snap = await getDocs(q);
+      
+      if (!snap.empty) {
+        return snap.docs[0].id;
+      }
+
+      const convRef = await addDoc(collection(db, 'conversations'), {
+          citizenId: phone,
+          status: 'OPEN',
+          sourceChannel: 'web',
+          assignedAgentId: null,
+          lastMessageAt: serverTimestamp(),
+          unreadCount: 1,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+      });
+
+      await addDoc(collection(db, 'messages'), {
+        conversationId: convRef.id,
+        senderType: 'bot',
+        senderId: 'system',
+        content: '¡Bienvenido al chat de atención! Un agente se conectará pronto.',
+        createdAt: serverTimestamp()
+      });
+
+      return convRef.id;
+    } catch (error: any) {
+      if (error.code === 'failed-precondition') {
+        console.error("🚨 FALTA ÍNDICE PARA WEBCHAT: citizenId + status", error);
+      }
+      throw error;
+    }
+};
 
 export const getSystemSettings = async (): Promise<SystemSettings | null> => {
   const docRef = doc(db, 'systemSettings', 'default');
@@ -196,88 +298,17 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>, us
   }, { merge: true });
 };
 
-// --- WEB CHAT / CITIZEN ---
-
-export const startWebConversation = async (name: string, phone: string) => {
-    // Actualizar o crear ciudadano
-    const citizenRef = doc(db, 'citizens', phone);
-    await setDoc(citizenRef, {
-        name,
-        phoneNumber: phone,
-        channel: 'web',
-        updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp()
-    }, { merge: true });
-
-    // Verificar si ya tiene conversación abierta
-    const q = query(
-      collection(db, 'conversations'),
-      where('citizenId', '==', phone),
-      where('status', 'in', ['OPEN', 'IN_PROGRESS'])
-    );
-    const snap = await getDocs(q);
-    
-    if (!snap.empty) {
-      return snap.docs[0].id;
-    }
-
-    // Crear nueva conversación
-    const convRef = await addDoc(collection(db, 'conversations'), {
-        citizenId: phone,
-        status: 'OPEN',
-        sourceChannel: 'web',
-        assignedAgentId: null,
-        lastMessageAt: serverTimestamp(),
-        unreadCount: 1,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp()
-    });
-
-    // Mensaje de bienvenida del sistema
-    await addDoc(collection(db, 'messages'), {
-      conversationId: convRef.id,
-      senderType: 'bot',
-      senderId: 'system',
-      content: '¡Bienvenido al chat de atención! Un agente se conectará pronto.',
-      createdAt: serverTimestamp()
-    });
-
-    return convRef.id;
-};
-
-export const sendMessageAsCitizen = async (conversationId: string, content: string, citizenId: string) => {
-    await addDoc(collection(db, 'messages'), {
-        conversationId,
-        senderType: 'citizen',
-        senderId: citizenId,
-        content,
-        createdAt: serverTimestamp()
-    });
-
-    await updateDoc(doc(db, 'conversations', conversationId), {
-        lastMessageAt: serverTimestamp(),
-        unreadCount: increment(1),
-        updatedAt: serverTimestamp()
-    });
-};
-
 export const getCitizenHistory = async (citizenId: string): Promise<Conversation[]> => {
-  // Obtenemos un subconjunto de conversaciones del ciudadano
   const q = query(
     collection(db, 'conversations'),
     where('citizenId', '==', citizenId),
-    limit(50)
+    orderBy('createdAt', 'desc'),
+    limit(20)
   );
   
   const snap = await getDocs(q);
-  const convos = snap.docs.map(doc => ({
+  return snap.docs.map(doc => ({
     id: doc.id,
     ...doc.data()
   } as Conversation));
-
-  // Filtramos solo las cerradas y ordenamos en cliente para evitar índices
-  return convos
-    .filter(c => c.status === 'CLOSED')
-    .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))
-    .slice(0, 20);
 };

@@ -1,23 +1,20 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Send, User, MessageCircle, X, Loader2 } from 'lucide-react';
+import { Send, MessageCircle, X, Loader2 } from 'lucide-react';
 import { startWebConversation, sendMessageAsCitizen, subscribeToMessages } from '../services/firestoreService';
 import { Message } from '../types';
 
 const PublicWebChat: React.FC = () => {
   const [step, setStep] = useState<'LOGIN' | 'CHAT'>('LOGIN');
   const [name, setName] = useState('');
-  const [phone, setPhone] = useState('');
+  const [phone, setPhone] = useState(''); // Se usa como ID del ciudadano
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputText, setInputText] = useState('');
-  
-  // Estado visual para la UI
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Referencia para bloqueo lógico inmediato (soluciona el race condition del doble clic)
-  const isSubmittingRef = useRef(false);
-
+  
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
+  // Suscripción a mensajes
   useEffect(() => {
     if (conversationId) {
       const unsubscribe = subscribeToMessages(conversationId, (data) => {
@@ -27,29 +24,24 @@ const PublicWebChat: React.FC = () => {
     }
   }, [conversationId]);
 
+  // Scroll automático al fondo al recibir mensajes
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   const handleStart = async (e: React.FormEvent) => {
     e.preventDefault();
-    // Verificación robusta: comprobamos tanto el estado como la referencia
-    if (!name || !phone || isSubmitting || isSubmittingRef.current) return;
+    if (!name.trim() || !phone.trim() || isSubmitting) return;
     
-    // Bloqueo inmediato síncrono
-    isSubmittingRef.current = true;
     setIsSubmitting(true);
-
     try {
       const id = await startWebConversation(name, phone);
       setConversationId(id);
       setStep('CHAT');
-      // No desbloqueamos aquí para evitar clics extra durante la transición de vista
     } catch (error) {
-      console.error(error);
-      alert('Error al iniciar chat');
-      // Solo desbloqueamos si hubo un error para permitir reintentar
-      isSubmittingRef.current = false;
+      console.error("Error al iniciar chat:", error);
+      alert('Error de conexión. Intente nuevamente.');
+    } finally {
       setIsSubmitting(false);
     }
   };
@@ -58,11 +50,15 @@ const PublicWebChat: React.FC = () => {
     e.preventDefault();
     if (!inputText.trim() || !conversationId) return;
     
+    const content = inputText.trim();
+    setInputText(''); // Limpieza optimista
+
     try {
-      await sendMessageAsCitizen(conversationId, inputText, phone);
-      setInputText('');
+      await sendMessageAsCitizen(conversationId, content, phone);
     } catch (error) {
-      console.error(error);
+      console.error("Error enviando mensaje:", error);
+      alert("No se pudo enviar el mensaje.");
+      setInputText(content); // Restaurar si falla
     }
   };
 
@@ -82,18 +78,18 @@ const PublicWebChat: React.FC = () => {
             </div>
           </div>
           {step === 'CHAT' && (
-             <button onClick={() => window.location.reload()} className="text-white/80 hover:text-white">
+             <button onClick={() => window.location.reload()} className="text-white/80 hover:text-white" title="Salir">
                <X size={20} />
              </button>
           )}
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-hidden bg-gray-50 relative">
+        <div className="flex-1 overflow-hidden bg-gray-50 relative flex flex-col">
           {step === 'LOGIN' ? (
             <div className="p-8 flex flex-col justify-center h-full">
               <h2 className="text-xl font-bold text-gray-800 mb-2 text-center">Bienvenido</h2>
-              <p className="text-gray-500 text-center mb-8 text-sm">Ingresa tus datos para iniciar una consulta en línea con un agente.</p>
+              <p className="text-gray-500 text-center mb-8 text-sm">Ingresa tus datos para iniciar una consulta en línea.</p>
               
               <form onSubmit={handleStart} className="space-y-4">
                 <div>
@@ -101,7 +97,7 @@ const PublicWebChat: React.FC = () => {
                   <input
                     type="text"
                     required
-                    className="w-full border border-gray-300 rounded-lg px-4 py-3 focus:ring-2 focus:ring-green-500 outline-none transition"
+                    className="w-full border border-gray-300 rounded-lg px-4 py-3 focus:ring-2 focus:ring-green-500 outline-none"
                     placeholder="Ej. Juan Pérez"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
@@ -112,7 +108,7 @@ const PublicWebChat: React.FC = () => {
                   <input
                     type="tel"
                     required
-                    className="w-full border border-gray-300 rounded-lg px-4 py-3 focus:ring-2 focus:ring-green-500 outline-none transition"
+                    className="w-full border border-gray-300 rounded-lg px-4 py-3 focus:ring-2 focus:ring-green-500 outline-none"
                     placeholder="Ej. 70012345"
                     value={phone}
                     onChange={(e) => setPhone(e.target.value)}
@@ -121,22 +117,20 @@ const PublicWebChat: React.FC = () => {
                 <button
                   type="submit"
                   disabled={isSubmitting}
-                  className={`w-full bg-green-600 text-white font-bold py-3 rounded-lg hover:bg-green-700 transition shadow-lg mt-4 flex items-center justify-center gap-2 ${isSubmitting ? 'opacity-70 cursor-not-allowed' : ''}`}
+                  className="w-full bg-green-600 text-white font-bold py-3 rounded-lg hover:bg-green-700 transition shadow-lg mt-4 flex items-center justify-center gap-2 disabled:opacity-70"
                 >
-                  {isSubmitting ? (
-                    <>
-                      <Loader2 size={20} className="animate-spin" /> Iniciando...
-                    </>
-                  ) : (
-                    'Iniciar Chat'
-                  )}
+                  {isSubmitting ? <Loader2 size={20} className="animate-spin" /> : 'Iniciar Chat'}
                 </button>
               </form>
             </div>
           ) : (
-            <div className="flex flex-col h-full">
+            <>
               {/* Messages Area */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-[#e5ddd5]">
+                {messages.length === 0 && (
+                   <p className="text-center text-gray-400 text-xs mt-4">Inicio de la conversación.</p>
+                )}
+                
                 {messages.map((msg) => {
                   const isCitizen = msg.senderType === 'citizen';
                   const isSystem = msg.senderType === 'bot';
@@ -144,26 +138,26 @@ const PublicWebChat: React.FC = () => {
                   if (isSystem) {
                     return (
                       <div key={msg.id} className="flex justify-center my-2">
-                        <span className="text-xs bg-blue-50 text-blue-800 px-3 py-1 rounded-full border border-blue-100">
+                        <span className="text-xs bg-blue-50 text-blue-800 px-3 py-1 rounded-full border border-blue-100 shadow-sm text-center">
                           {msg.content}
                         </span>
                       </div>
                     );
                   }
 
+                  if (msg.isInternal) return null;
+
                   return (
                     <div key={msg.id} className={`flex ${isCitizen ? 'justify-end' : 'justify-start'}`}>
-                      <div className={`flex flex-col max-w-[80%] ${isCitizen ? 'items-end' : 'items-start'}`}>
-                         <div className={`px-4 py-2 rounded-2xl text-sm shadow-sm ${
+                      <div className={`max-w-[85%] rounded-lg px-3 py-2 text-sm shadow-sm whitespace-pre-wrap ${
                            isCitizen 
-                             ? 'bg-green-600 text-white rounded-tr-none' 
-                             : 'bg-white text-gray-800 border border-gray-200 rounded-tl-none'
+                             ? 'bg-[#d9fdd3] text-gray-900 rounded-tr-none' 
+                             : 'bg-white text-gray-800 border-gray-200 rounded-tl-none'
                          }`}>
                            {msg.content}
-                         </div>
-                         <span className="text-[10px] text-gray-400 mt-1 px-1">
-                           {msg.createdAt?.toDate ? msg.createdAt.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '...'}
-                         </span>
+                           <div className="text-[10px] text-gray-500 mt-1 text-right opacity-70">
+                             {msg.createdAt?.toDate ? msg.createdAt.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '...'}
+                           </div>
                       </div>
                     </div>
                   );
@@ -172,11 +166,11 @@ const PublicWebChat: React.FC = () => {
               </div>
 
               {/* Input Area */}
-              <div className="p-3 bg-white border-t border-gray-200">
+              <div className="p-3 bg-[#f0f2f5] border-t border-gray-200">
                 <form onSubmit={handleSend} className="flex items-center gap-2">
                   <input
                     type="text"
-                    className="flex-1 border border-gray-300 rounded-full px-4 py-2 focus:outline-none focus:border-green-500 focus:ring-1 focus:ring-green-500 text-sm"
+                    className="flex-1 border-none rounded-lg px-4 py-2 focus:outline-none focus:ring-1 focus:ring-gray-300 text-sm bg-white h-10"
                     placeholder="Escribe tu mensaje..."
                     value={inputText}
                     onChange={(e) => setInputText(e.target.value)}
@@ -184,13 +178,13 @@ const PublicWebChat: React.FC = () => {
                   <button 
                     type="submit" 
                     disabled={!inputText.trim()}
-                    className="bg-green-600 text-white p-2 rounded-full hover:bg-green-700 disabled:opacity-50 transition shadow-sm"
+                    className="bg-green-600 text-white p-2 rounded-full hover:bg-green-700 disabled:opacity-50 transition shadow-sm h-10 w-10 flex items-center justify-center"
                   >
-                    <Send size={20} />
+                    <Send size={20} className="ml-0.5" />
                   </button>
                 </form>
               </div>
-            </div>
+            </>
           )}
         </div>
       </div>

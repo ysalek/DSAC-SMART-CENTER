@@ -20,8 +20,8 @@ const Login: React.FC = () => {
     setError('');
     setLoading(true);
 
-    // Lógica de resolución de usuario a correo para evitar consultas no autenticadas
-    let finalEmail = identifier.trim();
+    // Lógica de resolución de usuario a correo
+    let finalEmail = identifier.trim().toLowerCase(); // Sanitización: minúsculas y sin espacios
     const isUsername = !finalEmail.includes('@');
     
     if (isUsername) {
@@ -30,29 +30,33 @@ const Login: React.FC = () => {
 
     try {
       if (isRegistering) {
-        // En registro, forzamos la validación si se ingresó solo usuario
-        // 1. Crear usuario en Authentication (Email/Pass)
+        // 1. Crear usuario en Authentication
         const userCredential = await createUserWithEmailAndPassword(auth, finalEmail, password);
         const user = userCredential.user;
 
-        // 2. Verificar si el Admin ya pre-creó este agente en Firestore
-        const q = query(collection(db, 'agents'), where('email', '==', finalEmail));
-        const snapshot = await getDocs(q);
-
+        // 2. Verificar si el Admin ya pre-creó este agente en Firestore (Migración de perfil)
+        // Nota: Esto requiere que las reglas de Firestore permitan leer 'agents' al usuario recién creado.
         let role = 'AGENT';
-        let displayName = finalEmail.split('@')[0];
+        let displayName = identifier.split('@')[0];
 
-        if (!snapshot.empty) {
-          // ¡Existe pre-autorización!
-          const oldDoc = snapshot.docs[0];
-          const oldData = oldDoc.data();
-          
-          role = oldData.role || 'AGENT';
-          displayName = oldData.displayName || displayName;
+        try {
+          const q = query(collection(db, 'agents'), where('email', '==', finalEmail));
+          const snapshot = await getDocs(q);
 
-          if (oldDoc.id !== user.uid) {
-             await deleteDoc(doc(db, 'agents', oldDoc.id));
+          if (!snapshot.empty) {
+            const oldDoc = snapshot.docs[0];
+            const oldData = oldDoc.data();
+            
+            role = oldData.role || 'AGENT';
+            displayName = oldData.displayName || displayName;
+
+            if (oldDoc.id !== user.uid) {
+               // Borrar perfil temporal antiguo si existe
+               await deleteDoc(doc(db, 'agents', oldDoc.id));
+            }
           }
+        } catch (firestoreErr) {
+          console.warn("No se pudo verificar perfil pre-existente (probablemente permisos), continuando con defaults.", firestoreErr);
         }
 
         // 3. Guardar perfil definitivo
@@ -72,20 +76,26 @@ const Login: React.FC = () => {
       navigate('/');
     } catch (err: any) {
       console.error("Auth Error:", err);
-      if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
+      const errorCode = err.code;
+
+      if (errorCode === 'auth/invalid-credential' || errorCode === 'auth/user-not-found' || errorCode === 'auth/wrong-password') {
         setError(
           isRegistering 
-            ? 'Error al crear cuenta. Verifica que el correo sea válido.' 
-            : `Credenciales incorrectas.${isUsername ? ` (Intentando como ${finalEmail})` : ''} Si no tienes cuenta, regístrate.`
+            ? 'Error en el registro. Verifica tu conexión o intenta con otro correo.' 
+            : 'Credenciales incorrectas. Verifica el usuario/correo y contraseña.'
         );
-      } else if (err.code === 'auth/email-already-in-use') {
+      } else if (errorCode === 'auth/email-already-in-use') {
         setError('Este usuario/correo ya está registrado. Por favor inicia sesión.');
-      } else if (err.code === 'auth/weak-password') {
+      } else if (errorCode === 'auth/weak-password') {
         setError('La contraseña es muy débil (mínimo 6 caracteres).');
-      } else if (err.code === 'auth/too-many-requests') {
-        setError('Demasiados intentos fallidos. Por favor espera unos minutos.');
+      } else if (errorCode === 'auth/invalid-email') {
+        setError('El formato del correo electrónico no es válido (evita espacios).');
+      } else if (errorCode === 'auth/too-many-requests') {
+        setError('Cuenta bloqueada temporalmente por muchos intentos. Espera unos minutos.');
+      } else if (errorCode === 'auth/network-request-failed') {
+        setError('Error de conexión. Verifica tu internet.');
       } else {
-        setError('Error de autenticación: ' + (err.message || 'Desconocido'));
+        setError('Error de sistema: ' + (err.message || 'Desconocido'));
       }
     } finally {
       setLoading(false);
@@ -131,7 +141,7 @@ const Login: React.FC = () => {
               />
             </div>
             {!isRegistering && identifier && !identifier.includes('@') && (
-               <p className="text-xs text-gray-400 mt-1 ml-1">Se ingresará como: <b>{identifier}@{ORG_DOMAIN}</b></p>
+               <p className="text-xs text-gray-400 mt-1 ml-1">Se ingresará como: <b>{identifier.toLowerCase().trim()}@{ORG_DOMAIN}</b></p>
             )}
           </div>
 
