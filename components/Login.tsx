@@ -3,35 +3,44 @@ import { signInWithEmailAndPassword, createUserWithEmailAndPassword } from 'fire
 import { doc, setDoc, serverTimestamp, collection, query, where, getDocs, deleteDoc } from 'firebase/firestore';
 import { auth, db } from '../src/firebase';
 import { useNavigate } from 'react-router-dom';
-import { Lock, Mail, AlertCircle, Phone, ArrowRight } from 'lucide-react';
+import { Lock, Mail, AlertCircle, Phone, ArrowRight, User } from 'lucide-react';
 
 const Login: React.FC = () => {
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [isRegistering, setIsRegistering] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
 
+  const ORG_DOMAIN = 'santacruz.gob.bo';
+
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setLoading(true);
 
+    // Lógica de resolución de usuario a correo para evitar consultas no autenticadas
+    let finalEmail = identifier.trim();
+    const isUsername = !finalEmail.includes('@');
+    
+    if (isUsername) {
+      finalEmail = `${finalEmail}@${ORG_DOMAIN}`;
+    }
+
     try {
       if (isRegistering) {
+        // En registro, forzamos la validación si se ingresó solo usuario
         // 1. Crear usuario en Authentication (Email/Pass)
-        const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        const userCredential = await createUserWithEmailAndPassword(auth, finalEmail, password);
         const user = userCredential.user;
 
         // 2. Verificar si el Admin ya pre-creó este agente en Firestore
-        // Buscamos un documento en 'agents' que tenga este email
-        // Nota: Esto requiere que las reglas de seguridad permitan leer 'agents' al usuario recién creado
-        const q = query(collection(db, 'agents'), where('email', '==', email));
+        const q = query(collection(db, 'agents'), where('email', '==', finalEmail));
         const snapshot = await getDocs(q);
 
         let role = 'AGENT';
-        let displayName = email.split('@')[0];
+        let displayName = finalEmail.split('@')[0];
 
         if (!snapshot.empty) {
           // ¡Existe pre-autorización!
@@ -41,18 +50,16 @@ const Login: React.FC = () => {
           role = oldData.role || 'AGENT';
           displayName = oldData.displayName || displayName;
 
-          // Si el ID del documento antiguo no coincide con el nuevo UID de Auth,
-          // migramos los datos al nuevo documento (User ID) y borramos el viejo.
           if (oldDoc.id !== user.uid) {
              await deleteDoc(doc(db, 'agents', oldDoc.id));
           }
         }
 
-        // 3. Guardar/Actualizar el perfil definitivo con el UID correcto
+        // 3. Guardar perfil definitivo
         await setDoc(doc(db, 'agents', user.uid), {
           displayName: displayName,
-          email: email,
-          role: role, // Mantiene el rol que el Admin asignó (ej. ADMIN o SUPERVISOR)
+          email: finalEmail,
+          role: role,
           online: true,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp()
@@ -60,17 +67,19 @@ const Login: React.FC = () => {
 
       } else {
         // Login normal
-        await signInWithEmailAndPassword(auth, email, password);
+        await signInWithEmailAndPassword(auth, finalEmail, password);
       }
       navigate('/');
     } catch (err: any) {
       console.error("Auth Error:", err);
       if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
-        setError(isRegistering 
-          ? 'Error al crear cuenta. Verifica que el correo sea válido.' 
-          : 'Credenciales incorrectas. Si no tienes cuenta, selecciona "Activa tu cuenta aquí".');
+        setError(
+          isRegistering 
+            ? 'Error al crear cuenta. Verifica que el correo sea válido.' 
+            : `Credenciales incorrectas.${isUsername ? ` (Intentando como ${finalEmail})` : ''} Si no tienes cuenta, regístrate.`
+        );
       } else if (err.code === 'auth/email-already-in-use') {
-        setError('Este correo ya está registrado. Por favor inicia sesión.');
+        setError('Este usuario/correo ya está registrado. Por favor inicia sesión.');
       } else if (err.code === 'auth/weak-password') {
         setError('La contraseña es muy débil (mínimo 6 caracteres).');
       } else if (err.code === 'auth/too-many-requests') {
@@ -105,20 +114,25 @@ const Login: React.FC = () => {
           )}
 
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Correo Electrónico</label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              {isRegistering ? 'Correo Institucional' : 'Usuario o Correo'}
+            </label>
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                <Mail size={18} className="text-gray-400" />
+                {isRegistering ? <Mail size={18} className="text-gray-400" /> : <User size={18} className="text-gray-400" />}
               </div>
               <input
-                type="email"
+                type={isRegistering ? "email" : "text"}
                 required
                 className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500 transition-colors"
-                placeholder="operador@santacruz.gob.bo"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                placeholder={isRegistering ? `nombre@${ORG_DOMAIN}` : `operador (o nombre@${ORG_DOMAIN})`}
+                value={identifier}
+                onChange={(e) => setIdentifier(e.target.value)}
               />
             </div>
+            {!isRegistering && identifier && !identifier.includes('@') && (
+               <p className="text-xs text-gray-400 mt-1 ml-1">Se ingresará como: <b>{identifier}@{ORG_DOMAIN}</b></p>
+            )}
           </div>
 
           <div>
@@ -153,7 +167,7 @@ const Login: React.FC = () => {
           <div className="text-center pt-2">
             <button
               type="button"
-              onClick={() => { setError(''); setIsRegistering(!isRegistering); }}
+              onClick={() => { setError(''); setIsRegistering(!isRegistering); setIdentifier(''); }}
               className="text-sm text-green-700 hover:text-green-800 font-medium hover:underline focus:outline-none"
             >
               {isRegistering ? '¿Ya tienes contraseña? Inicia Sesión' : '¿Eres nuevo? Activa tu cuenta aquí'}
