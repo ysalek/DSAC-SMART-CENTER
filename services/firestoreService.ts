@@ -11,15 +11,22 @@ import {
   getDoc,
   setDoc,
   increment,
-  getDocs
+  getDocs,
+  limit,
+  startAfter,
+  limitToLast,
+  QueryDocumentSnapshot
 } from 'firebase/firestore';
 import { db } from '../src/firebase';
 import { Conversation, Message, SystemSettings } from '../types';
 
+// Escuchar solo conversaciones activas (Optimización: Ordenamiento en cliente para evitar error de índice)
 export const subscribeToConversations = (callback: (convos: Conversation[]) => void) => {
   const q = query(
     collection(db, 'conversations'),
-    orderBy('lastMessageAt', 'desc')
+    where('status', 'in', ['OPEN', 'IN_PROGRESS']),
+    // orderBy('lastMessageAt', 'desc'), // Eliminado para evitar error "failed-precondition" si falta índice
+    limit(100)
   );
 
   return onSnapshot(q, (snapshot) => {
@@ -27,15 +34,25 @@ export const subscribeToConversations = (callback: (convos: Conversation[]) => v
       id: doc.id,
       ...doc.data()
     } as Conversation));
+    
+    // Ordenar en cliente
+    convos.sort((a, b) => {
+       const tA = a.lastMessageAt?.seconds || 0;
+       const tB = b.lastMessageAt?.seconds || 0;
+       return tB - tA;
+    });
+
     callback(convos);
   });
 };
 
+// Escuchar últimos mensajes (Optimización: limitToLast)
 export const subscribeToMessages = (conversationId: string, callback: (msgs: Message[]) => void) => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'asc')
+    orderBy('createdAt', 'asc'),
+    limitToLast(200) // Límite duro para evitar carga masiva inicial
   );
 
   return onSnapshot(q, (snapshot) => {
@@ -47,12 +64,30 @@ export const subscribeToMessages = (conversationId: string, callback: (msgs: Mes
   });
 };
 
+// Paginación para historial antiguo
+export const getMessagesPage = async (conversationId: string, lastDoc: QueryDocumentSnapshot, pageSize: number = 50) => {
+  const q = query(
+    collection(db, 'messages'),
+    where('conversationId', '==', conversationId),
+    orderBy('createdAt', 'desc'), // Inverso para paginar hacia atrás
+    startAfter(lastDoc),
+    limit(pageSize)
+  );
+  
+  const snapshot = await getDocs(q);
+  return {
+    messages: snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)).reverse(),
+    lastDoc: snapshot.docs[snapshot.docs.length - 1]
+  };
+};
+
 // Obtener mensajes una sola vez (para historial/lectura)
 export const getMessagesOnce = async (conversationId: string): Promise<Message[]> => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'asc')
+    orderBy('createdAt', 'asc'),
+    limit(100)
   );
   
   const snapshot = await getDocs(q);
@@ -65,11 +100,10 @@ export const getMessagesOnce = async (conversationId: string): Promise<Message[]
 export const sendMessageAsAgent = async (
   conversationId: string, 
   content: string, 
-  agentId: string,
+  agentId: string, 
   attachments: string[] = [],
   isInternal: boolean = false
 ) => {
-  // 1. Add message to 'messages' collection
   await addDoc(collection(db, 'messages'), {
     conversationId,
     senderType: 'agent',
@@ -80,16 +114,19 @@ export const sendMessageAsAgent = async (
     createdAt: serverTimestamp()
   });
 
-  // 2. Update conversation (Only update lastMessageAt if it's NOT an internal note, usually)
-  // However, updating updatedAt is useful. We might not want to bump unreadCount or lastMessageAt for internal notes
-  // to avoid making it look like a response to the citizen if sorting by last interaction.
-  // For simplicity in this MVP, we treat it as an activity update.
-  
-  await updateDoc(doc(db, 'conversations', conversationId), {
-    updatedAt: serverTimestamp(),
-    // Optional: Update status to IN_PROGRESS if open
-    status: 'IN_PROGRESS'
-  });
+  // Solo actualizamos la conversación si NO es nota interna para no falsear tiempos de respuesta al ciudadano
+  if (!isInternal) {
+    await updateDoc(doc(db, 'conversations', conversationId), {
+      updatedAt: serverTimestamp(),
+      lastMessageAt: serverTimestamp(),
+      status: 'IN_PROGRESS'
+    });
+  } else {
+    // Para notas internas solo actualizamos updatedAt para auditoría
+    await updateDoc(doc(db, 'conversations', conversationId), {
+      updatedAt: serverTimestamp()
+    });
+  }
 };
 
 export const assignConversation = async (conversationId: string, agentId: string) => {
@@ -104,7 +141,6 @@ export const assignConversation = async (conversationId: string, agentId: string
 export const transferConversation = async (conversationId: string, toAgentId: string, fromAgentName: string) => {
   const docRef = doc(db, 'conversations', conversationId);
   
-  // Registrar mensaje de sistema indicando transferencia
   await addDoc(collection(db, 'messages'), {
     conversationId,
     senderType: 'bot',
@@ -150,17 +186,15 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>, us
 // --- WEB CHAT FUNCTIONS ---
 
 export const startWebConversation = async (name: string, phone: string) => {
-    // 1. Crear o Actualizar Ciudadano
     const citizenRef = doc(db, 'citizens', phone);
     await setDoc(citizenRef, {
         name,
         phoneNumber: phone,
         channel: 'web',
         updatedAt: serverTimestamp(),
-        createdAt: serverTimestamp() // setDoc con merge ignorará esto si ya existe, idealmente
+        createdAt: serverTimestamp()
     }, { merge: true });
 
-    // 2. Buscar si ya tiene una conversación abierta
     const q = query(
       collection(db, 'conversations'),
       where('citizenId', '==', phone),
@@ -172,7 +206,6 @@ export const startWebConversation = async (name: string, phone: string) => {
       return snap.docs[0].id;
     }
 
-    // 3. Crear Nueva Conversación
     const convRef = await addDoc(collection(db, 'conversations'), {
         citizenId: phone,
         status: 'OPEN',
@@ -184,8 +217,6 @@ export const startWebConversation = async (name: string, phone: string) => {
         updatedAt: serverTimestamp()
     });
 
-    // 4. Mensaje de bienvenida automático si aplica (opcional aquí, o manejado por trigger)
-    // Por simplicidad, añadimos un mensaje de sistema de inicio
     await addDoc(collection(db, 'messages'), {
       conversationId: convRef.id,
       senderType: 'bot',
@@ -217,13 +248,19 @@ export const getCitizenHistory = async (citizenId: string): Promise<Conversation
   const q = query(
     collection(db, 'conversations'),
     where('citizenId', '==', citizenId),
-    where('status', '==', 'CLOSED'),
-    orderBy('createdAt', 'desc')
+    // orderBy('createdAt', 'desc'), // Ordenar en cliente para evitar index
+    limit(50)
   );
   
   const snap = await getDocs(q);
-  return snap.docs.map(doc => ({
+  const convos = snap.docs.map(doc => ({
     id: doc.id,
     ...doc.data()
   } as Conversation));
+
+  // Filtrar y ordenar en cliente
+  return convos
+    .filter(c => c.status === 'CLOSED')
+    .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))
+    .slice(0, 20);
 };

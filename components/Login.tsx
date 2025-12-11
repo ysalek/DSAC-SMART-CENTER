@@ -26,6 +26,7 @@ const Login: React.FC = () => {
 
         // 2. Verificar si el Admin ya pre-creó este agente en Firestore
         // Buscamos un documento en 'agents' que tenga este email
+        // Nota: Esto requiere que las reglas de seguridad permitan leer 'agents' al usuario recién creado
         const q = query(collection(db, 'agents'), where('email', '==', email));
         const snapshot = await getDocs(q);
 
@@ -42,7 +43,6 @@ const Login: React.FC = () => {
 
           // Si el ID del documento antiguo no coincide con el nuevo UID de Auth,
           // migramos los datos al nuevo documento (User ID) y borramos el viejo.
-          // Esto es crucial para mantener la consistencia en Firestore.
           if (oldDoc.id !== user.uid) {
              await deleteDoc(doc(db, 'agents', oldDoc.id));
           }
@@ -64,15 +64,19 @@ const Login: React.FC = () => {
       }
       navigate('/');
     } catch (err: any) {
-      console.error(err);
+      console.error("Auth Error:", err);
       if (err.code === 'auth/invalid-credential' || err.code === 'auth/user-not-found' || err.code === 'auth/wrong-password') {
-        setError('Credenciales incorrectas.');
+        setError(isRegistering 
+          ? 'Error al crear cuenta. Verifica que el correo sea válido.' 
+          : 'Credenciales incorrectas. Si no tienes cuenta, selecciona "Activa tu cuenta aquí".');
       } else if (err.code === 'auth/email-already-in-use') {
         setError('Este correo ya está registrado. Por favor inicia sesión.');
       } else if (err.code === 'auth/weak-password') {
         setError('La contraseña es muy débil (mínimo 6 caracteres).');
+      } else if (err.code === 'auth/too-many-requests') {
+        setError('Demasiados intentos fallidos. Por favor espera unos minutos.');
       } else {
-        setError('Error de autenticación: ' + err.message);
+        setError('Error de autenticación: ' + (err.message || 'Desconocido'));
       }
     } finally {
       setLoading(false);
@@ -94,9 +98,9 @@ const Login: React.FC = () => {
 
         <form onSubmit={handleAuth} className="p-8 space-y-6">
           {error && (
-            <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded flex items-center gap-3">
-              <AlertCircle size={20} className="text-red-500" />
-              <p className="text-sm text-red-700">{error}</p>
+            <div className="bg-red-50 border-l-4 border-red-500 p-4 rounded flex items-center gap-3 animate-pulse">
+              <AlertCircle size={20} className="text-red-500 flex-shrink-0" />
+              <p className="text-sm text-red-700 font-medium">{error}</p>
             </div>
           )}
 
@@ -150,7 +154,7 @@ const Login: React.FC = () => {
             <button
               type="button"
               onClick={() => { setError(''); setIsRegistering(!isRegistering); }}
-              className="text-sm text-green-700 hover:text-green-800 font-medium hover:underline"
+              className="text-sm text-green-700 hover:text-green-800 font-medium hover:underline focus:outline-none"
             >
               {isRegistering ? '¿Ya tienes contraseña? Inicia Sesión' : '¿Eres nuevo? Activa tu cuenta aquí'}
             </button>

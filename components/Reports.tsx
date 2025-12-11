@@ -27,19 +27,15 @@ const Reports: React.FC = () => {
   const fetchReports = async () => {
     setLoading(true);
     try {
-      // Basic query for closed conversations
-      // Note: Complex querying with multiple inequalities requires composite indexes.
-      // For MVP, we fetch closed conversations ordered by date and filter in client if needed,
-      // or use simple date range query.
-      
       const start = new Date(startDate);
       start.setHours(0, 0, 0, 0);
       const end = new Date(endDate);
       end.setHours(23, 59, 59, 999);
 
+      // Consulta simplificada: Solo por rango de fecha, filtro de estado en cliente
+      // Esto evita requerir un índice compuesto (status + updatedAt)
       const q = query(
         collection(db, 'conversations'),
-        where('status', '==', 'CLOSED'),
         where('updatedAt', '>=', Timestamp.fromDate(start)),
         where('updatedAt', '<=', Timestamp.fromDate(end)),
         orderBy('updatedAt', 'desc')
@@ -48,6 +44,9 @@ const Reports: React.FC = () => {
       const snapshot = await getDocs(q);
       let data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Conversation));
 
+      // Filtros en memoria
+      data = data.filter(c => c.status === 'CLOSED');
+
       if (selectedAgent !== 'ALL') {
         data = data.filter(c => c.assignedAgentId === selectedAgent);
       }
@@ -55,7 +54,7 @@ const Reports: React.FC = () => {
       setConversations(data);
     } catch (error) {
       console.error("Error fetching reports:", error);
-      alert("Error cargando reportes. Verifica si el índice compuesto está creado en Firebase.");
+      alert("Error cargando reportes.");
     } finally {
       setLoading(false);
     }

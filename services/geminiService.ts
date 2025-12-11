@@ -1,9 +1,8 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, Type } from "@google/genai";
 import { Message } from "../types";
 
-// Inicialización del cliente.
-// NOTA: 'process.env.API_KEY' es inyectado por el entorno de Google AI Studio.
 const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const MODEL_NAME = "gemini-2.5-flash";
 
 /**
  * Genera una sugerencia de respuesta (Smart Reply)
@@ -16,60 +15,46 @@ export const generateSmartReply = async (
 ): Promise<string> => {
   if (conversationHistory.length === 0) return "";
 
-  // Modelo Flash para baja latencia
-  const model = "gemini-2.5-flash";
-
-  // Formato de historial para el prompt (Últimos 8 mensajes para contexto inmediato)
-  const historyText = conversationHistory
-    .slice(-8)
-    .map(m => `[${m.senderType === 'agent' ? 'Operador' : 'Ciudadano'}]: ${m.content}`)
-    .join('\n');
-
-  // Instrucción del sistema robusta
-  const defaultInstruction = `
-    Actúa como un asistente oficial de la Dirección de Atención al Ciudadano (DSAC) de Santa Cruz.
-    Tu tono debe ser profesional, empático, claro y en español neutro (Latam).
-    Nunca inventes trámites, fechas ni requisitos que no estén en la BASE DE CONOCIMIENTO.
-    Si no sabes la respuesta, sugiere amablemente que el ciudadano espere a un agente humano.
-  `;
+  // Construir historial estructurado para la SDK
+  // Nota: Mapeamos 'citizen' a 'user' y 'agent' a 'model' para contexto
+  const historyParts = conversationHistory.slice(-8).map(m => {
+    return {
+      role: m.senderType === 'agent' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    };
+  });
 
   const systemInstruction = `
-    ${customSystemPrompt || defaultInstruction}
+    Actúa como un asistente oficial de la Dirección de Atención al Ciudadano (DSAC) de Santa Cruz.
     
-    INSTRUCCIONES CLAVE:
-    1. Usa la "BASE DE CONOCIMIENTO" adjunta como verdad absoluta.
-    2. Sé breve (máximo 50-60 palabras) para facilitar la lectura en WhatsApp.
-    3. No saludes repetitivamente si el historial muestra que ya están hablando.
-  `;
-
-  const prompt = `
-    DATOS DEL CIUDADANO: ${citizenName}
+    INSTRUCCIONES:
+    1. Responde en español neutro (Latam), profesional y empático.
+    2. Usa la BASE DE CONOCIMIENTO (RAG) proporcionada como única fuente de verdad para trámites.
+    3. Si no sabes la respuesta, sugiere esperar a un humano.
+    4. Sé breve (máx 60 palabras).
     
-    === BASE DE CONOCIMIENTO (RAG) ===
-    ${knowledgeBaseContext || "Sin información adicional disponible."}
-    ==================================
-
-    === HISTORIAL DE CONVERSACIÓN ===
-    ${historyText}
-    =================================
-
-    Genera la siguiente respuesta sugerida para el Operador:
+    ${customSystemPrompt ? `INSTRUCCIÓN PERSONALIZADA: ${customSystemPrompt}` : ''}
+    
+    BASE DE CONOCIMIENTO:
+    ${knowledgeBaseContext || "No disponible."}
   `;
 
   try {
     const response = await ai.models.generateContent({
-      model,
-      contents: prompt,
+      model: MODEL_NAME,
+      contents: [
+        ...historyParts,
+        { role: 'user', parts: [{ text: `Genera una respuesta sugerida para ${citizenName}.` }] }
+      ],
       config: {
-        systemInstruction,
-        temperature: 0.3, // Baja temperatura para respuestas más factuales y menos creativas
+        systemInstruction: systemInstruction,
+        temperature: 0.3,
         maxOutputTokens: 150,
       }
     });
     return response.text?.trim() || "";
   } catch (error) {
     console.error("Gemini API Error:", error);
-    // Fallback silencioso para no romper la UI
     return ""; 
   }
 };
@@ -82,15 +67,15 @@ export const analyzeIntent = async (text: string): Promise<string> => {
   
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: `Analiza el mensaje de este ciudadano y clasifícalo en UNA sola categoría: 
-      TRAMITE, EMERGENCIA, IMPUESTOS, SALUD, QUEJA, SALUDO, OTRO.
-      
-      Mensaje: "${text}"
-      
-      Respuesta (solo la palabra):`,
+      model: MODEL_NAME,
+      contents: {
+         parts: [{
+             text: `Analiza el mensaje y clasifícalo en UNA categoría: TRAMITE, EMERGENCIA, IMPUESTOS, SALUD, QUEJA, SALUDO, OTRO. Mensaje: "${text}"`
+         }]
+      },
       config: {
         temperature: 0,
+        maxOutputTokens: 20,
       }
     });
     return response.text?.trim().toUpperCase() || "OTRO";
@@ -100,7 +85,7 @@ export const analyzeIntent = async (text: string): Promise<string> => {
 };
 
 /**
- * Analiza el caso completo para generar resumen y etiquetas
+ * Analiza el caso completo para generar resumen y etiquetas (JSON Mode)
  */
 export const analyzeCaseConversation = async (
   messages: Message[],
@@ -108,49 +93,42 @@ export const analyzeCaseConversation = async (
 ): Promise<{ summary: string; tags: string[] }> => {
   if (messages.length === 0) return { summary: "", tags: [] };
 
-  const historyText = messages
-    .map(m => `[${m.senderType === 'agent' ? 'Operador' : 'Ciudadano'}]: ${m.content}`)
+  const conversationText = messages
+    .map(m => `${m.senderType === 'agent' ? 'Operador' : 'Ciudadano'}: ${m.content}`)
     .join('\n');
-
-  const prompt = `
-    Analiza la siguiente conversación de atención al ciudadano y extrae información estructurada.
-    
-    CIUDADANO: ${citizenName}
-    
-    === CONVERSACIÓN ===
-    ${historyText}
-    ====================
-
-    TAREA:
-    1. Resumen: Escribe un resumen conciso (máx 2 frases) sobre qué trató el caso y cómo terminó (o si quedó pendiente).
-    2. Etiquetas: Identifica de 1 a 4 etiquetas clave (palabras cortas, mayúsculas) que clasifiquen el problema (ej. IMPUESTOS, CONSULTA, RECLAMO, SALUD, BASURA).
-
-    Responde ÚNICAMENTE con un objeto JSON válido con este formato:
-    {
-      "summary": "texto del resumen...",
-      "tags": ["TAG1", "TAG2"]
-    }
-  `;
 
   try {
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
+      model: MODEL_NAME,
+      contents: {
+        parts: [{
+          text: `Analiza esta conversación con ${citizenName}:\n\n${conversationText}`
+        }]
+      },
       config: {
+        systemInstruction: "Eres un analista de calidad. Genera un resumen breve y etiquetas clave.",
         responseMimeType: "application/json",
-        temperature: 0.1, // Muy determinista
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING, description: "Resumen de 2 frases del caso." },
+            tags: { 
+              type: Type.ARRAY, 
+              items: { type: Type.STRING },
+              description: "Lista de 1 a 4 etiquetas (ej. IMPUESTOS, SALUD)."
+            }
+          },
+          required: ["summary", "tags"]
+        },
+        temperature: 0.1,
       }
     });
 
-    const text = response.text || "{}";
-    const result = JSON.parse(text);
+    const jsonText = response.text || "{}";
+    return JSON.parse(jsonText);
     
-    return {
-      summary: result.summary || "",
-      tags: result.tags || []
-    };
   } catch (error) {
     console.error("Error analyzing case:", error);
-    return { summary: "Error al analizar con IA.", tags: [] };
+    return { summary: "Error al analizar.", tags: [] };
   }
 };
