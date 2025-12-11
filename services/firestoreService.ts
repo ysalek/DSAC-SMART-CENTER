@@ -20,13 +20,15 @@ import {
 import { db } from '../src/firebase';
 import { Conversation, Message, SystemSettings } from '../types';
 
-// Escuchar solo conversaciones activas (Optimización: Ordenamiento en cliente para evitar error de índice)
+// --- CONVERSATIONS ---
+
+// Escuchar solo conversaciones activas
+// Optimización: Traemos un subconjunto y ordenamos en cliente para evitar requerir índices compuestos complejos en desarrollo.
 export const subscribeToConversations = (callback: (convos: Conversation[]) => void) => {
   const q = query(
     collection(db, 'conversations'),
     where('status', 'in', ['OPEN', 'IN_PROGRESS']),
-    // orderBy('lastMessageAt', 'desc'), // Eliminado para evitar error "failed-precondition" si falta índice
-    limit(100)
+    limit(100) // Límite de seguridad
   );
 
   return onSnapshot(q, (snapshot) => {
@@ -35,7 +37,7 @@ export const subscribeToConversations = (callback: (convos: Conversation[]) => v
       ...doc.data()
     } as Conversation));
     
-    // Ordenar en cliente
+    // Ordenamiento en cliente: Más reciente primero
     convos.sort((a, b) => {
        const tA = a.lastMessageAt?.seconds || 0;
        const tB = b.lastMessageAt?.seconds || 0;
@@ -46,13 +48,16 @@ export const subscribeToConversations = (callback: (convos: Conversation[]) => v
   });
 };
 
-// Escuchar últimos mensajes (Optimización: limitToLast)
+// --- MESSAGES ---
+
+// Escuchar últimos mensajes de un chat
+// Optimización: Usamos limitToLast para no traer todo el historial histórico en la primera carga.
 export const subscribeToMessages = (conversationId: string, callback: (msgs: Message[]) => void) => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
     orderBy('createdAt', 'asc'),
-    limitToLast(200) // Límite duro para evitar carga masiva inicial
+    limitToLast(100) 
   );
 
   return onSnapshot(q, (snapshot) => {
@@ -64,24 +69,27 @@ export const subscribeToMessages = (conversationId: string, callback: (msgs: Mes
   });
 };
 
-// Paginación para historial antiguo
+// Paginación para historial antiguo (Infinite Scroll)
 export const getMessagesPage = async (conversationId: string, lastDoc: QueryDocumentSnapshot, pageSize: number = 50) => {
   const q = query(
     collection(db, 'messages'),
     where('conversationId', '==', conversationId),
-    orderBy('createdAt', 'desc'), // Inverso para paginar hacia atrás
+    orderBy('createdAt', 'desc'), // Inverso para ir hacia atrás en el tiempo
     startAfter(lastDoc),
     limit(pageSize)
   );
   
   const snapshot = await getDocs(q);
+  // Revertimos para que el array quede en orden cronológico si se necesita
+  const messages = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)).reverse();
+  
   return {
-    messages: snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Message)).reverse(),
+    messages,
     lastDoc: snapshot.docs[snapshot.docs.length - 1]
   };
 };
 
-// Obtener mensajes una sola vez (para historial/lectura)
+// Obtener mensajes una sola vez (para visualización de historial en modal)
 export const getMessagesOnce = async (conversationId: string): Promise<Message[]> => {
   const q = query(
     collection(db, 'messages'),
@@ -96,6 +104,8 @@ export const getMessagesOnce = async (conversationId: string): Promise<Message[]
     ...doc.data()
   } as Message));
 };
+
+// --- ACTIONS ---
 
 export const sendMessageAsAgent = async (
   conversationId: string, 
@@ -114,7 +124,8 @@ export const sendMessageAsAgent = async (
     createdAt: serverTimestamp()
   });
 
-  // Solo actualizamos la conversación si NO es nota interna para no falsear tiempos de respuesta al ciudadano
+  // Solo actualizamos la conversación si NO es nota interna
+  // Esto mantiene el ordenamiento de "último mensaje del ciudadano/agente real" correcto.
   if (!isInternal) {
     await updateDoc(doc(db, 'conversations', conversationId), {
       updatedAt: serverTimestamp(),
@@ -122,7 +133,7 @@ export const sendMessageAsAgent = async (
       status: 'IN_PROGRESS'
     });
   } else {
-    // Para notas internas solo actualizamos updatedAt para auditoría
+    // Para notas internas solo actualizamos updatedAt para auditoría técnica
     await updateDoc(doc(db, 'conversations', conversationId), {
       updatedAt: serverTimestamp()
     });
@@ -165,6 +176,8 @@ export const closeConversation = async (conversationId: string, disposition: str
   });
 };
 
+// --- SYSTEM SETTINGS ---
+
 export const getSystemSettings = async (): Promise<SystemSettings | null> => {
   const docRef = doc(db, 'systemSettings', 'default');
   const docSnap = await getDoc(docRef);
@@ -183,9 +196,10 @@ export const updateSystemSettings = async (settings: Partial<SystemSettings>, us
   }, { merge: true });
 };
 
-// --- WEB CHAT FUNCTIONS ---
+// --- WEB CHAT / CITIZEN ---
 
 export const startWebConversation = async (name: string, phone: string) => {
+    // Actualizar o crear ciudadano
     const citizenRef = doc(db, 'citizens', phone);
     await setDoc(citizenRef, {
         name,
@@ -195,6 +209,7 @@ export const startWebConversation = async (name: string, phone: string) => {
         createdAt: serverTimestamp()
     }, { merge: true });
 
+    // Verificar si ya tiene conversación abierta
     const q = query(
       collection(db, 'conversations'),
       where('citizenId', '==', phone),
@@ -206,6 +221,7 @@ export const startWebConversation = async (name: string, phone: string) => {
       return snap.docs[0].id;
     }
 
+    // Crear nueva conversación
     const convRef = await addDoc(collection(db, 'conversations'), {
         citizenId: phone,
         status: 'OPEN',
@@ -217,6 +233,7 @@ export const startWebConversation = async (name: string, phone: string) => {
         updatedAt: serverTimestamp()
     });
 
+    // Mensaje de bienvenida del sistema
     await addDoc(collection(db, 'messages'), {
       conversationId: convRef.id,
       senderType: 'bot',
@@ -245,10 +262,10 @@ export const sendMessageAsCitizen = async (conversationId: string, content: stri
 };
 
 export const getCitizenHistory = async (citizenId: string): Promise<Conversation[]> => {
+  // Obtenemos un subconjunto de conversaciones del ciudadano
   const q = query(
     collection(db, 'conversations'),
     where('citizenId', '==', citizenId),
-    // orderBy('createdAt', 'desc'), // Ordenar en cliente para evitar index
     limit(50)
   );
   
@@ -258,7 +275,7 @@ export const getCitizenHistory = async (citizenId: string): Promise<Conversation
     ...doc.data()
   } as Conversation));
 
-  // Filtrar y ordenar en cliente
+  // Filtramos solo las cerradas y ordenamos en cliente para evitar índices
   return convos
     .filter(c => c.status === 'CLOSED')
     .sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0))

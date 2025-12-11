@@ -1,13 +1,12 @@
 import { auth } from '../src/firebase';
 
 const getBaseUrl = () => {
+  // Priorizar variable de entorno de Vite
   const meta = import.meta as any;
-  // Usar variable de entorno VITE o fallback relativo para proxy
   if (meta.env && meta.env.VITE_FUNCTIONS_BASE_URL) {
     return meta.env.VITE_FUNCTIONS_BASE_URL;
   }
-  // En desarrollo local a veces es útil un fallback explícito, 
-  // pero en prod debe venir de la config.
+  // Fallback para desarrollo local si no está configurado
   return "https://us-central1-chat-inteligente-fdeb8.cloudfunctions.net";
 };
 
@@ -26,6 +25,7 @@ export const sendWhatsAppMessage = async (
       throw new Error("No hay sesión de usuario activa.");
     }
 
+    // Obtener token para autenticar la petición al backend
     const idToken = await currentUser.getIdToken();
 
     const response = await fetch(`${FUNCTIONS_BASE_URL}/sendWhatsAppMessage`, {
